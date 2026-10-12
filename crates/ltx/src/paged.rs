@@ -168,6 +168,16 @@ pub async fn build_page_map<C: ReplicaClient>(client: &C, plan: &[FileInfo]) -> 
         )
         .await?;
     let header = Header::parse(&header_bytes)?;
+    // A complete cut indexes every page except SQLite's lock page. Each
+    // index entry takes at least three bytes (pgno, offset, size varints),
+    // so even the entire plan's object sizes give a conservative upper bound
+    // on dense slots. Include page zero and the possibly omitted lock page.
+    // Unlike a fixed page limit, this admits large databases while preventing
+    // a tiny corrupt index from allocating through an arbitrary page number.
+    let max_slots = plan.iter().try_fold(2u64, |slots, info| {
+        let bytes = u64::try_from(info.size).map_err(|_| Error::LTXCorrupted)?;
+        Ok::<_, Error>(slots.saturating_add(bytes / 3))
+    })?;
     let fetches: Vec<_> = plan
         .iter()
         .map(|info| fetch_page_index(client, info))
@@ -184,7 +194,7 @@ pub async fn build_page_map<C: ReplicaClient>(client: &C, plan: &[FileInfo]) -> 
     };
     while let Some(index) = indexes.next().await {
         let info = planned.next().expect("one index per planned object");
-        map.insert_object(info, index?)?;
+        map.insert_object(info, index?, max_slots)?;
     }
     Ok(map)
 }
@@ -192,7 +202,12 @@ pub async fn build_page_map<C: ReplicaClient>(client: &C, plan: &[FileInfo]) -> 
 impl PageMap {
     /// Points every page in `index` at `info`, over whatever an earlier object
     /// mapped it to: the plan is oldest first, so the newest version wins.
-    fn insert_object(&mut self, info: &FileInfo, index: Vec<(u32, u64, u64)>) -> Result<()> {
+    fn insert_object(
+        &mut self,
+        info: &FileInfo,
+        index: Vec<(u32, u64, u64)>,
+        max_slots: u64,
+    ) -> Result<()> {
         let id = u32::try_from(self.objects.len())
             .ok()
             .filter(|id| *id != NO_OBJECT)
@@ -209,8 +224,24 @@ impl PageMap {
             .filter(|pgno| *pgno <= commit)
             .max();
         if let Some(top) = top {
-            let len = top as usize + 1;
+            let slots = u64::from(top) + 1;
+            if slots > max_slots {
+                return Err(Error::LTXCorrupted);
+            }
+            let len = usize::try_from(slots).map_err(|_| Error::LTXCorrupted)?;
             if len > self.object.len() {
+                let additional = len - self.object.len();
+                // Reserve before resize so allocator refusal is an error,
+                // not a process abort. Keep amortized growth for long plans.
+                self.object
+                    .try_reserve(additional)
+                    .map_err(|error| Error::Other(Box::new(error)))?;
+                self.offset
+                    .try_reserve(additional)
+                    .map_err(|error| Error::Other(Box::new(error)))?;
+                self.size
+                    .try_reserve(additional)
+                    .map_err(|error| Error::Other(Box::new(error)))?;
                 self.object.resize(len, NO_OBJECT);
                 self.offset.resize(len, 0);
                 self.size.resize(len, 0);
