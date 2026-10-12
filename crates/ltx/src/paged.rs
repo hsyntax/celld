@@ -127,7 +127,8 @@ pub struct PageLocator<'a> {
 /// Page numbers are dense, so the map is three columns indexed by page number
 /// over the plan's objects, each held once: 16 bytes a page. A hash map of
 /// owned locators, which copied the object's `FileInfo` into every page,
-/// measured ~114 bytes a page and 27 s to build for a 100 GiB database.
+/// measured ~142 bytes a page: 187 MB, rather than 21 MB, held for as long as
+/// a 5 GiB cell runs paged.
 #[derive(Debug)]
 pub struct PageMap {
     pub page_size: u32,
