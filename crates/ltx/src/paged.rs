@@ -19,7 +19,6 @@ use crate::ltx_file_path;
 use crate::TXID;
 use futures_util::StreamExt;
 use std::collections::BTreeSet;
-use std::collections::HashMap;
 use std::io::Read;
 use std::io::Seek;
 use std::sync::Mutex;
@@ -113,9 +112,9 @@ pub async fn fetch_page_index<C: ReplicaClient>(
 
 /// Where one page's frame lives: the object that holds it and the byte range of
 /// its frame within that object.
-#[derive(Debug, Clone)]
-pub struct PageLocator {
-    pub info: FileInfo,
+#[derive(Debug, Clone, Copy)]
+pub struct PageLocator<'a> {
+    pub info: &'a FileInfo,
     pub offset: u64,
     pub size: u64,
 }
@@ -124,12 +123,28 @@ pub struct PageLocator {
 /// page, plus the page size and the database's page count at the cut. Built
 /// once from a plan and never updated in place, so a faulted page always comes
 /// from the pinned cut even as newer objects land.
+///
+/// Page numbers are dense, so the map is three columns indexed by page number
+/// over the plan's objects, each held once: 16 bytes a page. A hash map of
+/// owned locators, which copied the object's `FileInfo` into every page,
+/// measured ~142 bytes a page: 187 MB, rather than 21 MB, held for as long as
+/// a 5 GiB cell runs paged.
 #[derive(Debug)]
 pub struct PageMap {
     pub page_size: u32,
     pub commit: u32,
-    pub pages: HashMap<u32, PageLocator>,
+    /// The plan's objects, oldest first; `object` indexes them.
+    objects: Vec<FileInfo>,
+    /// Per page number, the object that serves the page, or [`NO_OBJECT`].
+    object: Vec<u32>,
+    /// Per page number, where the page's frame starts in its object.
+    offset: Vec<u64>,
+    /// Per page number, the frame's length.
+    size: Vec<u32>,
 }
+
+/// The `object` entry of a page no planned object holds.
+const NO_OBJECT: u32 = u32::MAX;
 
 /// Builds a page map over a restore `plan` (as [`crate::replica::calc_restore_plan`]
 /// returns it, oldest object first) without downloading the objects. It fetches
@@ -138,7 +153,6 @@ pub struct PageMap {
 /// each page. The page size and commit come from the newest object's header.
 pub async fn build_page_map<C: ReplicaClient>(client: &C, plan: &[FileInfo]) -> Result<PageMap> {
     let newest = plan.last().ok_or(Error::TxNotAvailable)?;
-    let mut pages: HashMap<u32, PageLocator> = HashMap::new();
     // The indexes are independent reads, so fetch them concurrently; a whale's
     // plan of two dozen objects otherwise costs two round-trips each, in
     // series, on the activation path. `buffered` keeps plan order for the
@@ -155,36 +169,109 @@ pub async fn build_page_map<C: ReplicaClient>(client: &C, plan: &[FileInfo]) -> 
         )
         .await?;
     let header = Header::parse(&header_bytes)?;
+    // A complete cut indexes every page except SQLite's lock page. Each
+    // index entry takes at least three bytes (pgno, offset, size varints),
+    // so even the entire plan's object sizes give a conservative upper bound
+    // on dense slots. Include page zero and the possibly omitted lock page.
+    // Unlike a fixed page limit, this admits large databases while preventing
+    // a tiny corrupt index from allocating through an arbitrary page number.
+    let max_slots = plan.iter().try_fold(2u64, |slots, info| {
+        let bytes = u64::try_from(info.size).map_err(|_| Error::LTXCorrupted)?;
+        Ok::<_, Error>(slots.saturating_add(bytes / 3))
+    })?;
     let fetches: Vec<_> = plan
         .iter()
         .map(|info| fetch_page_index(client, info))
         .collect();
     let mut indexes = futures_util::stream::iter(fetches).buffered(INDEX_FETCH_CONCURRENCY);
     let mut planned = plan.iter();
-    while let Some(index) = indexes.next().await {
-        let info = planned.next().expect("one index per planned object");
-        let index = index?;
-        // An older object can hold pages past the newest commit (the
-        // database shrank since); they are not part of the cut.
-        for (pgno, offset, size) in index.into_iter().filter(|(p, _, _)| *p <= header.commit) {
-            pages.insert(
-                pgno,
-                PageLocator {
-                    info: info.clone(),
-                    offset,
-                    size,
-                },
-            );
-        }
-    }
-    Ok(PageMap {
+    let mut map = PageMap {
         page_size: header.page_size,
         commit: header.commit,
-        pages,
-    })
+        objects: Vec::with_capacity(plan.len()),
+        object: Vec::new(),
+        offset: Vec::new(),
+        size: Vec::new(),
+    };
+    while let Some(index) = indexes.next().await {
+        let info = planned.next().expect("one index per planned object");
+        map.insert_object(info, index?, max_slots)?;
+    }
+    Ok(map)
 }
 
 impl PageMap {
+    /// Points every page in `index` at `info`, over whatever an earlier object
+    /// mapped it to: the plan is oldest first, so the newest version wins.
+    fn insert_object(
+        &mut self,
+        info: &FileInfo,
+        index: Vec<(u32, u64, u64)>,
+        max_slots: u64,
+    ) -> Result<()> {
+        let id = u32::try_from(self.objects.len())
+            .ok()
+            .filter(|id| *id != NO_OBJECT)
+            .ok_or(Error::LTXCorrupted)?;
+        self.objects.push(info.clone());
+        // An older object can hold pages past the newest commit (the
+        // database shrank since); they are not part of the cut. Size the
+        // columns once per object, not page by page: the base snapshot
+        // usually names every page, so this is one allocation.
+        let commit = self.commit;
+        let top = index
+            .iter()
+            .map(|(pgno, _, _)| *pgno)
+            .filter(|pgno| *pgno <= commit)
+            .max();
+        if let Some(top) = top {
+            let slots = u64::from(top) + 1;
+            if slots > max_slots {
+                return Err(Error::LTXCorrupted);
+            }
+            let len = usize::try_from(slots).map_err(|_| Error::LTXCorrupted)?;
+            if len > self.object.len() {
+                let additional = len - self.object.len();
+                // Reserve before resize so allocator refusal is an error,
+                // not a process abort. Keep amortized growth for long plans.
+                self.object
+                    .try_reserve(additional)
+                    .map_err(|error| Error::Other(Box::new(error)))?;
+                self.offset
+                    .try_reserve(additional)
+                    .map_err(|error| Error::Other(Box::new(error)))?;
+                self.size
+                    .try_reserve(additional)
+                    .map_err(|error| Error::Other(Box::new(error)))?;
+                self.object.resize(len, NO_OBJECT);
+                self.offset.resize(len, 0);
+                self.size.resize(len, 0);
+            }
+        }
+        for (pgno, offset, size) in index.into_iter().filter(|(p, _, _)| *p <= commit) {
+            let at = pgno as usize;
+            self.object[at] = id;
+            self.offset[at] = offset;
+            self.size[at] = u32::try_from(size).map_err(|_| Error::LTXCorrupted)?;
+        }
+        Ok(())
+    }
+
+    /// Where `pgno`'s frame lives in the cut. `None` when the cut has no such
+    /// page (a page above the commit, or one never written).
+    pub fn get(&self, pgno: u32) -> Option<PageLocator<'_>> {
+        let at = pgno as usize;
+        let object = *self.object.get(at)?;
+        if object == NO_OBJECT {
+            return None;
+        }
+        Some(PageLocator {
+            info: &self.objects[object as usize],
+            offset: self.offset[at],
+            size: u64::from(self.size[at]),
+        })
+    }
+
     /// Serves one page: range-reads its frame from the object the map points to
     /// and decodes it. `None` when the cut has no such page (a page above the
     /// commit, or one never written).
@@ -193,7 +280,7 @@ impl PageMap {
         client: &C,
         pgno: u32,
     ) -> Result<Option<Vec<u8>>> {
-        let Some(loc) = self.pages.get(&pgno) else {
+        let Some(loc) = self.get(pgno) else {
             return Ok(None);
         };
         let frame = client
@@ -222,7 +309,7 @@ impl PageMap {
         pgno: u32,
         max_bytes: u64,
     ) -> Result<Vec<(u32, Vec<u8>)>> {
-        let Some(first) = self.pages.get(&pgno) else {
+        let Some(first) = self.get(pgno) else {
             return Ok(Vec::new());
         };
         // The cap is in decoded page bytes: frames are LZ4-compressed, and a
@@ -231,22 +318,23 @@ impl PageMap {
         let max_pages = (max_bytes / u64::from(self.page_size)).max(1) as u32;
         let mut end = first.offset + first.size;
         let mut last = pgno;
-        while let Some(next) = self.pages.get(&(last + 1)) {
-            let adjacent = next.info == first.info && next.offset == end;
+        while let Some(next) = self.get(last + 1) {
+            // The same planned object: both locators borrow its one entry.
+            let adjacent = std::ptr::eq(next.info, first.info) && next.offset == end;
             if !adjacent || last + 1 - pgno >= max_pages {
                 break;
             }
             end += next.size;
             last += 1;
         }
-        let bytes = reader.read_range(&first.info, first.offset, end - first.offset)?;
+        let bytes = reader.read_range(first.info, first.offset, end - first.offset)?;
         let mut run = Vec::with_capacity((last - pgno + 1) as usize);
         let mut at = 0;
         if (bytes.len() as u64) < end - first.offset {
             return Err(Error::LTXCorrupted);
         }
         for pgno_ in pgno..=last {
-            let size = self.pages[&pgno_].size as usize;
+            let size = self.size[pgno_ as usize] as usize;
             let page = decode_page_frame_of(&bytes[at..at + size], self.page_size as usize, pgno_)?;
             run.push((pgno_, page));
             at += size;
